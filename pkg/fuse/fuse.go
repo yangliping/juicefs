@@ -243,7 +243,16 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	defer releaseContext(ctx)
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
 	if err != 0 {
-		return fuse.Status(err)
+		if err == syscall.ENOENT {
+			retryEntry, retryFh, retryErr := fs.retryOpenAfterLookup(cancel, in)
+			if retryErr != 0 {
+				return fuse.Status(retryErr)
+			}
+			entry = retryEntry
+			fh = retryFh
+		} else {
+			return fuse.Status(err)
+		}
 	}
 	out.Fh = fh
 	if vfs.IsSpecialNode(Ino(in.NodeId)) {
@@ -254,6 +263,32 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 		fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
 	}
 	return 0
+}
+
+func (fs *fileSystem) retryOpenAfterLookup(cancel <-chan struct{}, in *fuse.OpenIn) (*meta.Entry, uint64, syscall.Errno) {
+	ctx := fs.newContext(cancel, &in.InHeader)
+	defer releaseContext(ctx)
+	if bridge, ok := fs.RawFileSystem.(*fuseFS.rawBridge); ok {
+		inode := bridge.kernelNodeIds[in.NodeId]
+		if inode != nil {
+			inode.mu.Lock()
+			parentData := inode.parents.get()
+			inode.mu.Unlock()
+			if parentData != nil {
+				fsserv.EntryNotify(parentData.parent.nodeId, parentData.name)
+				var lookupOut fuse.EntryOut
+				lookupStatus := fs.Lookup(cancel, &in.InHeader, parentData.name, &lookupOut)
+				if lookupStatus == fuse.OK {
+					entry, fh, err := fs.v.Open(ctx, Ino(lookupOut.NodeId), in.Flags)
+					if err == 0 {
+						return entry, fh, 0
+					}
+					return entry, fh, err
+				}
+			}
+		}
+	}
+	return nil, 0, syscall.ENOENT
 }
 
 func (fs *fileSystem) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
